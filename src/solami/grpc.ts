@@ -214,8 +214,11 @@ export class GrpcFeed extends EventEmitter<GrpcFeedEvents> {
       this.lastSlot = tx.slot;
       this.status.lastSlot = tx.slot;
     }
+    // Solami often streams a slot's transactions before its slot update, so the first
+    // sighting of either marks when the slot became visible to us.
     const seen = this.slotSeen.get(tx.slot);
-    if (seen !== undefined) {
+    if (seen === undefined) this.slotSeen.set(tx.slot, now);
+    else {
       this.lags.push(now - seen);
       if (this.lags.length > 500) this.lags.shift();
     }
