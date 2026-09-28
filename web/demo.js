@@ -10,6 +10,14 @@ const b58 = (n) => Array.from({ length: n }, () => pick(B58)).join("");
 const short = (a) => `${a.slice(0, 4)}…${a.slice(-4)}`;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const f1 = (n) => n.toFixed(1);
+const pl = (n, one, many = one + "s") => `${n} ${n === 1 ? one : many}`;
+const median = (arr) => {
+  if (!arr.length) return null;
+  const a = arr.slice().sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+};
+const FF_MIN = 12; // minutes of history simulated before the page shows
 
 const SUPPLY = 1e9;
 const P0 = 2.8e-8; // pump.fun starting price, SOL per token
@@ -36,18 +44,27 @@ function weighted(opts) {
   return opts[0][0];
 }
 
+// Hand-armed mints the tracker never saw launching have no risk data.
+function unknownRisk() {
+  return {
+    score: 0, level: "unknown", flags: [],
+    metrics: { devInitialPct: 0, devHeldPct: 0, devSoldPct: 0, devTransferredPct: 0, bundlerPct: 0, bundlers: 0, sniperPct: 0, snipers: 0, linkedWallets: 0, insiderHeldPct: 0, uniqueBuyers: 0, buySellRatio: 0, drawdownPct: 0 },
+  };
+}
+
 function scoreOf(t) {
+  if (t.adopted) return unknownRisk();
   const m = t.m;
   const flags = [];
   const add = (id, severity, weight, detail) => flags.push({ id, severity, weight, detail });
-  if (m.bundlerPct >= 10) add("bundled", "danger", 30, `${m.bundlers} wallets bought ${f1(m.bundlerPct)}% in the creation slot`);
-  else if (m.bundlerPct >= 3) add("bundled", "warning", 15, `${m.bundlers} wallets bought ${f1(m.bundlerPct)}% in the creation slot`);
-  if (m.sniperPct >= 20) add("sniped", "danger", 20, `${m.snipers} snipers took ${f1(m.sniperPct)}% within the first slots`);
-  else if (m.sniperPct >= 8) add("sniped", "warning", 10, `${m.snipers} snipers took ${f1(m.sniperPct)}% within the first slots`);
+  if (m.bundlerPct >= 10) add("bundled", "danger", 30, `${pl(m.bundlers, "wallet")} bought ${f1(m.bundlerPct)}% in the creation slot`);
+  else if (m.bundlerPct >= 3) add("bundled", "warning", 15, `${pl(m.bundlers, "wallet")} bought ${f1(m.bundlerPct)}% in the creation slot`);
+  if (m.sniperPct >= 20) add("sniped", "danger", 20, `${pl(m.snipers, "sniper")} took ${f1(m.sniperPct)}% within the first slots`);
+  else if (m.sniperPct >= 8) add("sniped", "warning", 10, `${pl(m.snipers, "sniper")} took ${f1(m.sniperPct)}% within the first slots`);
   if (m.devInitialPct >= 10) add("dev_bag", "warning", 15, `dev bought ${f1(m.devInitialPct)}% of supply at launch`);
   if (m.devSoldPct >= 50) add("dev_dumped", "danger", 25, `dev has sold ${f1(m.devSoldPct)}% of their bag`);
   else if (m.devSoldPct >= 10) add("dev_selling", "warning", 12, `dev has sold ${f1(m.devSoldPct)}% of their bag`);
-  if (m.devTransferredPct >= 0.5) add("dev_moved", "danger", 20, `dev moved ${f1(m.devTransferredPct)}% of supply to ${t.recipients} other wallet(s)`);
+  if (m.devTransferredPct >= 0.5) add("dev_moved", "danger", 20, `dev moved ${f1(m.devTransferredPct)}% of supply to ${pl(t.recipients, "other wallet")}`);
   if (m.insiderHeldPct >= 25) add("insiders_hold", "danger", 20, `dev, bundlers and snipers still hold ${f1(m.insiderHeldPct)}%`);
   else if (m.insiderHeldPct >= 12) add("insiders_hold", "warning", 10, `dev, bundlers and snipers still hold ${f1(m.insiderHeldPct)}%`);
   if (m.drawdownPct >= 70 && t.trades > 10) add("collapsed", "danger", 20, `price is ${f1(m.drawdownPct)}% below its high`);
@@ -66,7 +83,8 @@ export function createDemo(emit, opts = {}) {
   let exits = [];
   const queue = []; // scheduled {at, fn}
   let live = false;
-  let now = Date.now() - 6 * 60 * 1000;
+  let now = Date.now() - FF_MIN * 60 * 1000;
+  const baseline = []; // 5-min moves of watched tokens sampled at random times
   const start = now;
   let nextSpawn = now;
   let tickN = 0;
@@ -112,7 +130,7 @@ export function createDemo(emit, opts = {}) {
     // Blur enrichment arrives a couple of seconds later
     at(t + rnd(1200, 4000), () => { tok.enriched = true; blur.calls++; if (Math.random() < 0.02) blur.errors++; });
     // auto-watch risky-but-tradeable launches (what a sniper bot would be holding)
-    const autoP = rug ? 0.22 : profile === "pump" ? 0.1 : 0.02;
+    const autoP = rug ? 0.13 : profile === "pump" ? 0.06 : 0.012;
     if (Math.random() < autoP) at(t + rnd(1500, 5000), () => tokens.has(tok.mint) && arm(tok, "auto", true));
     // rugs: dev splits supply to fresh wallets first sometimes, then dumps
     if (rug) {
@@ -140,7 +158,7 @@ export function createDemo(emit, opts = {}) {
       mint: t.mint, name: t.name, symbol: t.symbol, uri: t.uri, creator: t.creator, createdAt: t.createdAt,
       price: t.price, priceUsd, mcapUsd: priceUsd * SUPPLY, athPrice: t.athPrice, progress: t.progress, migrated: t.migrated,
       trades: t.trades, buys: t.buys, sells: t.sells, volumeSol: t.volumeSol, risk: t.risk, enriched: t.enriched,
-      watched: watches.has(t.mint), spark: t.spark.slice(-60),
+      adopted: !!t.adopted, supply: SUPPLY, watched: watches.has(t.mint), spark: t.spark.slice(-60),
     };
   }
 
@@ -178,20 +196,35 @@ export function createDemo(emit, opts = {}) {
     w.lastAlert = a;
     out("alert", a);
     out("watch", watchView(w));
-    // follow-up: track the drop an exit would have avoided
+    // follow-ups: max drop within 10 min, signed move at +1m and +5m, folded repeat triggers
     let min = a.price;
-    for (let k = 1; k <= 12; k++) {
-      at(now + k * 1500, () => {
+    const push = () => {
+      alerts = alerts.map((x) => (x.id === a.id ? a : x));
+      if (w.lastAlert?.id === a.id) w.lastAlert = a;
+      out("alert_update", { ...a });
+    };
+    for (const [key, ms] of [["move1m", 60e3], ["move5m", 300e3]]) {
+      at(now + ms, () => {
+        const tk = tokens.get(t.mint);
+        if (!tk) return;
+        a[key] = (tk.price / a.price - 1) * 100;
+        push();
+      });
+    }
+    if (severity === "critical" && Math.random() < 0.35) {
+      at(now + rnd(1500, 4000), () => { a.suppressed = ri(1, 3); push(); });
+    }
+    const checks = [...Array.from({ length: 12 }, (_, k) => (k + 1) * 1500), ...Array.from({ length: 39 }, (_, k) => 30e3 + k * 15e3)];
+    for (const dt of checks) {
+      at(now + dt, () => {
         const tk = tokens.get(t.mint);
         if (!tk) return;
         min = Math.min(min, tk.price);
         const avoided = (1 - min / a.price) * 100;
         if (avoided <= 0.05 && a.avoidedPct === undefined) return;
-        const upd = { ...a, minPriceAfter: min, avoidedPct: avoided };
-        Object.assign(a, upd);
-        alerts = alerts.map((x) => (x.id === a.id ? a : x));
-        if (w.lastAlert?.id === a.id) w.lastAlert = a;
-        out("alert_update", { ...a });
+        if (a.avoidedPct !== undefined && Math.abs(avoided - a.avoidedPct) < 0.05) return;
+        Object.assign(a, { minPriceAfter: min, avoidedPct: avoided });
+        push();
       });
     }
     if (severity === "critical" && w.autoExit && !w.exited) {
@@ -235,17 +268,17 @@ export function createDemo(emit, opts = {}) {
   }
 
   function devTransfer(t) {
-    if (!tokens.has(t.mint) || t.rugged) return;
+    if (!tokens.has(t.mint) || t.rugged || t.adopted) return;
     const pct = rnd(3, 12);
     t.recipients = ri(2, 6);
     t.m.devTransferredPct = pct;
     t.m.devHeldPct = Math.max(0, t.m.devHeldPct - pct);
     t.m.linkedWallets += t.recipients;
-    fire(t, "dev_transfer", "critical", `Dev moved ${f1(pct)}% of supply`, `${short(t.creator)} sent tokens to ${t.recipients} fresh wallet(s) - classic pre-dump split`, t.creator);
+    fire(t, "dev_transfer", "critical", `Dev moved ${f1(pct)}% of supply`, `${short(t.creator)} sent tokens to ${pl(t.recipients, "fresh wallet")} - classic pre-dump split`, t.creator);
   }
 
   function rugPull(t) {
-    if (!tokens.has(t.mint)) return;
+    if (!tokens.has(t.mint) || t.adopted) return;
     t.rugged = 1;
     const kind = pick(["dev", "dev", "cohort"]);
     const bag = rnd(82, 100);
@@ -270,12 +303,14 @@ export function createDemo(emit, opts = {}) {
     if (age > 7 * 60e3 && !watches.has(t.mint)) return false;
     let r;
     if (t.rugged) {
-      r = t.rugged < 8 ? -rnd(0.1, 0.24) : rnd(-0.03, 0.02);
+      r = t.rugged < 7 ? -rnd(0.05, 0.13) : rnd(-0.02, 0.019);
       t.rugged++;
     } else {
-      const decay = Math.max(0.2, 1 - age / 240e3);
-      r = t.drift * decay + rnd(-0.03, 0.03);
-      if (Math.random() < 0.015) r += t.profile === "pump" ? rnd(0.05, 0.14) : rnd(-0.09, 0.08);
+      const decay = Math.max(-0.04, 1 - age / 150e3); // early hype, then the usual bleed
+      const young = age < 150e3;
+      const vol = young ? 0.03 : 0.012;
+      r = t.drift * decay + rnd(-vol, vol);
+      if (young && Math.random() < 0.015) r += t.profile === "pump" ? rnd(0.05, 0.14) : rnd(-0.09, 0.08);
     }
     const trades = Math.random() < 0.6 ? ri(1, 3) : 0;
     if (trades) {
@@ -303,6 +338,7 @@ export function createDemo(emit, opts = {}) {
     const withAvoid = alerts.filter((a) => a.avoidedPct > 0).map((a) => a.avoidedPct).sort((a, b) => a - b);
     const det = alerts.map((a) => a.detectMs).sort((a, b) => a - b);
     const med = (arr) => (arr.length ? arr[Math.floor(arr.length / 2)] : 0);
+    const crit5m = alerts.filter((a) => a.severity === "critical" && a.move5m !== undefined).map((a) => a.move5m);
     return {
       uptimeSec: Math.round((now - start) / 1000) + 3600 * 2 + 1260,
       grpc: { connected: true, reconnects: 1, lastSlot: slot, txTotal, txPerSec, msgPerSec: Math.round(txPerSec * 1.18), watchedAccounts: 2 + watches.size * 2, replayedFromSlot: 318_441_212 },
@@ -316,6 +352,8 @@ export function createDemo(emit, opts = {}) {
         launchesSeen, tracked: tokens.size, watches: watches.size,
         alertsFired: alerts.length, criticalAlerts: alerts.filter((a) => a.severity === "critical").length,
         medianAvoidedPct: med(withAvoid), medianDetectMs: med(det),
+        alertMove5m: median(crit5m), baselineMove5m: median(baseline),
+        alertSamples: crit5m.length, baselineSamples: baseline.length,
       },
     };
   }
@@ -341,6 +379,15 @@ export function createDemo(emit, opts = {}) {
         if (w) out("watch", watchView(w));
       }
     }
+    // baseline: watched tokens at random moments (mostly quiet periods, like the real sampler)
+    if (tickN % 12 === 0 && watches.size) {
+      const w = pick([...watches.values()]);
+      const tk = tokens.get(w.mint);
+      if (tk && (tk.rugged >= 7 || tk.rugAt - now > 300e3)) {
+        const p0 = tk.price;
+        at(now + 300e3, () => { const t2 = tokens.get(w.mint); if (t2) baseline.push((t2.price / p0 - 1) * 100); });
+      }
+    }
     if (tickN % 4 === 0) {
       slot += ri(2, 3);
       solUsd = clamp(solUsd + rnd(-0.08, 0.08), 140, 160);
@@ -353,9 +400,10 @@ export function createDemo(emit, opts = {}) {
   // a couple of manual watches and a manual paper exit for variety
   const pool = [...tokens.values()].filter((t) => !watches.has(t.mint) && t.profile !== "rug");
   for (const t of pool.slice(-2)) arm(t, "manual", false);
+  arm(findOrCreate(b58(40) + "pump"), "manual", false); // hand-armed mint with no launch data -> risk "unknown"
   live = true;
   emit("snapshot", {
-    launches: [...tokens.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, 150).map(view),
+    launches: [...tokens.values()].sort((a, b) => b.createdAt - a.createdAt).filter((t, i) => i < 150 || watches.has(t.mint)).map(view),
     watches: [...watches.values()].map(watchView),
     alerts, exits: exits.map((e) => ({ ...e })), health: health(),
     config: { exitMode, autoWatch: true, blur: true, wallet: b58(44) },
@@ -387,11 +435,13 @@ export function createDemo(emit, opts = {}) {
   function findOrCreate(mint) {
     let t = tokens.get(mint);
     if (!t) {
-      t = spawn(Date.now() - 20 * 60e3);
+      t = spawn(now - 40 * 60e3);
       tokens.delete(t.mint);
       t.mint = mint;
       t.profile = "slow";
       t.rugAt = Infinity;
+      t.adopted = true;
+      t.risk = unknownRisk();
       tokens.set(mint, t);
     }
     return t;

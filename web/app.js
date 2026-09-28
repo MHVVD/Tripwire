@@ -12,6 +12,28 @@ const params = new URLSearchParams(location.search);
 const DEMO_ALLOWED = params.get("demo") === "1";
 const BOOT_T = Date.now();
 
+// Auth token: taken from ?token= once, kept in localStorage, and stripped from the
+// address bar so it doesn't show up in screen recordings.
+const TOKEN_KEY = "tripwire.token";
+let TOKEN = params.get("token") || "";
+try {
+  if (TOKEN) localStorage.setItem(TOKEN_KEY, TOKEN);
+  else TOKEN = localStorage.getItem(TOKEN_KEY) || "";
+} catch {}
+if (params.has("token")) {
+  const u = new URL(location.href);
+  u.searchParams.delete("token");
+  history.replaceState(null, "", u.pathname + u.search + u.hash);
+}
+const AUTH_HINT = "Unauthorized: open the URL printed in the terminal (with ?token=)";
+let authHinted = false;
+function authFailed() {
+  if (authHinted) return;
+  authHinted = true;
+  toast(AUTH_HINT, "error", 12000);
+  setTimeout(() => (authHinted = false), 15000);
+}
+
 // ---------------------------------------------------------------------------
 // Store: plain mutable state + rAF-batched re-render
 // ---------------------------------------------------------------------------
@@ -45,14 +67,14 @@ function bump() {
   });
 }
 
-function toast(msg, kind = "info") {
+function toast(msg, kind = "info", ms = 3200) {
   const id = Math.random().toString(36).slice(2);
   store.toasts = [...store.toasts, { id, msg, kind }].slice(-4);
   bump();
   setTimeout(() => {
     store.toasts = store.toasts.filter((t) => t.id !== id);
     bump();
-  }, 3200);
+  }, ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +166,7 @@ let demo = null;
 
 function connect() {
   if (demo) return;
-  es = new EventSource("/api/stream");
+  es = new EventSource(TOKEN ? `/api/stream?token=${encodeURIComponent(TOKEN)}` : "/api/stream");
   es.onopen = () => {
     retry = 0;
     store.conn = "live";
@@ -167,6 +189,12 @@ function connect() {
     es = null;
     store.conn = "reconnecting";
     bump();
+    // EventSource hides the HTTP status; probe once to tell a missing token from a down server.
+    if (retry === 0) {
+      fetch("/api/snapshot", { headers: authHeaders() })
+        .then((r) => r.status === 401 && authFailed())
+        .catch(() => {});
+    }
     const delay = Math.min(15000, 800 * 2 ** retry++) + Math.random() * 300;
     clearTimeout(retryTimer);
     retryTimer = setTimeout(connect, delay);
@@ -198,13 +226,22 @@ setInterval(() => {
 // ---------------------------------------------------------------------------
 // REST
 // ---------------------------------------------------------------------------
+function authHeaders(extra = {}) {
+  return TOKEN ? { ...extra, "x-tripwire-token": TOKEN } : extra;
+}
+
 async function api(method, path, body) {
   if (demo) return demo.api(method, path, body);
+  const mutating = method !== "GET" && method !== "HEAD";
   const r = await fetch(path, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    headers: authHeaders(mutating ? { "content-type": "application/json" } : {}),
+    body: mutating ? JSON.stringify(body ?? {}) : undefined,
   });
+  if (r.status === 401) {
+    authFailed();
+    throw Object.assign(new Error(AUTH_HINT), { quiet: true });
+  }
   if (!r.ok) {
     let msg = `${r.status}`;
     try {
@@ -222,7 +259,7 @@ async function withPending(key, fn) {
   try {
     return await fn();
   } catch (e) {
-    toast(e.message || String(e), "error");
+    if (!e.quiet) toast(e.message || String(e), "error");
   } finally {
     store.pending.delete(key);
     bump();
@@ -348,8 +385,12 @@ const solscanToken = (m) => `https://solscan.io/token/${m}`;
 const solscanAcct = (a) => `https://solscan.io/account/${a}`;
 const pumpUrl = (m) => `https://pump.fun/coin/${m}`;
 
-const LEVEL_LABEL = { low: "LOW", medium: "MED", high: "HIGH", critical: "CRIT" };
-const levelOf = (risk) => risk?.level || "low";
+const LEVEL_LABEL = { unknown: "UNKNOWN", low: "LOW", medium: "MED", high: "HIGH", critical: "CRIT" };
+// No risk report at all (or level "unknown": armed by hand, no launch data) is never shown as LOW.
+const levelOf = (risk) => (risk?.level && LEVEL_LABEL[risk.level] ? risk.level : "unknown");
+const isUnknown = (risk) => levelOf(risk) === "unknown";
+const riskScore = (risk) => (isUnknown(risk) ? "?" : Math.round(risk.score));
+const plural = (n, one, many = one + "s") => `${fmtInt(n)} ${n === 1 ? one : many}`;
 const cx = (...c) => c.filter(Boolean).join(" ");
 
 // ---------------------------------------------------------------------------
@@ -404,8 +445,8 @@ function PriceChart({ data, entry, alertPrices = [] }) {
 }
 
 function RiskGauge({ risk }) {
-  const score = risk?.score ?? 0;
   const lvl = levelOf(risk);
+  const score = lvl === "unknown" ? 0 : risk?.score ?? 0;
   const R = 70, cxp = 90, cyp = 86;
   const arc = (from, to) => {
     const a0 = Math.PI * (1 - from), a1 = Math.PI * (1 - to);
@@ -424,7 +465,7 @@ function RiskGauge({ risk }) {
       <path d=${arc(0, f)} class="g-val" />
       <circle cx=${cxp + R * Math.cos(na)} cy=${cyp - R * Math.sin(na)} r="5" class="g-dot" />
     </svg>
-    <div class="g-score">${Math.round(score)}</div>
+    <div class="g-score">${riskScore(risk)}</div>
     <div class="g-level">${(lvl || "").toUpperCase()} RISK</div>
   </div>`;
 }
@@ -434,8 +475,9 @@ function RiskGauge({ risk }) {
 // ---------------------------------------------------------------------------
 const RiskBadge = ({ risk, size = "md" }) => {
   const lvl = levelOf(risk);
-  return html`<div class=${cx("rbadge", "lvl-" + lvl, size)} title=${`${lvl} risk`}>
-    <b>${risk ? Math.round(risk.score) : "–"}</b><span>${LEVEL_LABEL[lvl]}</span>
+  const tip = lvl === "unknown" ? "risk unknown: armed by hand, no launch data" : `${lvl} risk`;
+  return html`<div class=${cx("rbadge", "lvl-" + lvl, size)} title=${tip}>
+    <b>${riskScore(risk)}</b><span>${LEVEL_LABEL[lvl]}</span>
   </div>`;
 };
 
@@ -480,8 +522,9 @@ function TopBar() {
       <${Pill} state=${g?.connected ? "ok" : hl ? "bad" : "idle"} label="gRPC" value=${g?.connected ? `${fmtInt(g.txPerSec)} tx/s` : "down"} title=${g?.lastError || "Yellowstone gRPC firehose"} />
       <${Pill} state=${ok(behind) && behind > 8 ? "warn" : g?.lastSlot ? "ok" : "idle"} label="slot" value=${html`${fmtInt(g?.lastSlot)}${ok(behind) ? html`<em class=${behind > 8 ? "warn" : ""}> ${behind > 0 ? MINUS + behind : "tip"}</em>` : null}`} title="last processed slot · slots behind chain tip" />
       <${Pill} state=${!hl?.blur?.enabled ? "idle" : hl.blur.ok ? "ok" : "bad"} label="Blur" value=${!hl?.blur?.enabled ? "off" : hl.blur.ok ? `${Math.round(hl.blur.avgMs)}ms` : "err"} title=${hl?.blur?.lastError || "Blur market data"} />
-      <${Pill} state=${hl?.beam?.failed > 0 && hl.beam.landed === 0 ? "warn" : hl ? "ok" : "idle"} label="Beam" value=${hl ? `${hl.beam.landed}/${hl.beam.sent}` : "—"} title="Beam landed / sent" />
-      <${Pill} state=${hl?.rpc?.ok === false ? "bad" : hl ? "ok" : "idle"} label="SOL" value=${ok(hl?.solUsd) ? `$${hl.solUsd.toFixed(2)}` : "—"} title=${hl?.rpc?.lastError || "SOL/USD"} />
+      <${Pill} state=${!hl || !hl.beam.sent ? "idle" : hl.beam.failed > 0 && hl.beam.landed === 0 ? "warn" : "ok"} label="Beam" value=${hl ? `${hl.beam.landed}/${hl.beam.sent}` : "—"} title="Beam landed / sent" />
+      <${Pill} state=${!hl ? "idle" : hl.rpc?.ok ? "ok" : "idle"} label="RPC" value=${!hl ? "—" : hl.rpc?.ok ? "ok" : "off"} title=${hl?.rpc?.lastError || "Solami RPC"} />
+      <${Pill} state="neutral" label="SOL" value=${ok(hl?.solUsd) && hl.solUsd > 0 ? `$${hl.solUsd.toFixed(2)}` : "—"} title="SOL/USD" />
       <div class=${cx("stream", conn)}>
         <i class="pulse"></i>
         ${conn === "live" ? "STREAMING" : conn === "demo" ? "DEMO STREAM" : conn === "reconnecting" ? "RECONNECTING…" : "CONNECTING…"}
@@ -490,18 +533,35 @@ function TopBar() {
   </header>`;
 }
 
+// Honest outcome check: median signed 5-min move after critical alerts vs. a random-time baseline.
+function outcomeTile(s) {
+  const mv = s?.alertMove5m;
+  const base = s?.baselineMove5m;
+  if (!ok(mv)) {
+    return { k: "5-min after critical alert", v: html`<span class="collecting">collecting…</span>`, sub: s?.alertSamples ? `n=${s.alertSamples} so far` : "median price move, needs 5 min of data" };
+  }
+  const baseTxt = ok(base) ? `vs ${fmtPct(base, true)} baseline` : "baseline collecting…";
+  return {
+    k: "5-min after critical alert",
+    v: fmtPct(mv, true),
+    sub: `${baseTxt} · n=${fmtInt(s.alertSamples)}`,
+    cls: mv < 0 ? "red neg" : "green",
+    title: `Median signed price move 5 minutes after a critical alert (n=${s.alertSamples}), vs the same watched tokens sampled at random times (n=${s.baselineSamples ?? 0}).`,
+  };
+}
+
 function Hero() {
   const s = store.health?.stats;
   const tx = store.health?.grpc;
   const tiles = [
     { k: "Launches seen", v: fmtInt(s?.launchesSeen), sub: s ? `${fmtInt(s.tracked)} tracked live` : "" },
-    { k: "Under watch", v: fmtInt(s?.watches ?? store.watches.size), sub: `${[...store.watches.values()].filter((w) => w.autoExit).length} with auto-exit`, cls: "accent" },
+    { k: "Under watch", v: fmtInt(s?.watches ?? store.watches.size), sub: `${fmtInt([...store.watches.values()].filter((w) => w.autoExit).length)} with auto-exit`, cls: "accent" },
     { k: "Alerts fired", v: fmtInt(s?.alertsFired), sub: html`<span class="crit-txt">${fmtInt(s?.criticalAlerts)} critical</span>`, cls: s?.criticalAlerts ? "red" : "" },
-    { k: "Median drop avoided", v: ok(s?.medianAvoidedPct) && s.medianAvoidedPct > 0 ? `${MINUS}${s.medianAvoidedPct.toFixed(1)}%` : "—", sub: "price fall after alert", cls: "green big" },
-    { k: "Median detection", v: ok(s?.medianDetectMs) ? fmtMs(s.medianDetectMs) : "—", sub: "slot first seen → alert" },
+    outcomeTile(s),
+    { k: "Processing latency", v: ok(s?.medianDetectMs) && s.medianDetectMs > 0 ? fmtMs(s.medianDetectMs) : "—", sub: "median · stream → alert" },
   ];
   return html`<section class="hero">
-    ${tiles.map((t) => html`<div class=${cx("tile", t.cls)}>
+    ${tiles.map((t) => html`<div class=${cx("tile", t.cls)} title=${t.title}>
       <div class="tk">${t.k}</div>
       <div class="tv">${t.v}</div>
       <div class="ts">${t.sub}</div>
@@ -565,8 +625,8 @@ class LaunchRow extends Component {
 
 const FILTERS = [
   ["all", "All"],
-  ["low", "Low risk"],
-  ["high", "High risk"],
+  ["low", "Low"],
+  ["high", "High"],
   ["watched", "Watched"],
 ];
 
@@ -586,7 +646,7 @@ function LaunchRadar({ launches }) {
     <div class="ph">
       <h2><span class="live-dot"></span>Launch Radar <small>pump.fun · live</small></h2>
       <div class="chips">
-        ${FILTERS.map(([k, label]) => html`<button class=${cx("fchip", f === k && "on", "f-" + k)} onClick=${() => { store.filter = k; bump(); }}>
+        ${FILTERS.map(([k, label]) => html`<button class=${cx("fchip", f === k && "on", "f-" + k)} title=${k === "low" || k === "high" ? `${label} risk` : undefined} onClick=${() => { store.filter = k; bump(); }}>
           ${label}<b>${counts[k]}</b>
         </button>`)}
       </div>
@@ -605,7 +665,7 @@ const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 function ArmForm() {
   const [mint, setMint] = useState("");
-  const [auto, setAuto] = useState(true);
+  const [auto, setAuto] = useState(false); // off by default: in live mode this arms real sells
   const valid = MINT_RE.test(mint.trim());
   const submit = async (e) => {
     e.preventDefault();
@@ -630,11 +690,14 @@ function WatchCard({ w, launch }) {
       <div class="wid">
         <div><span class="sym">$${w.symbol || short(w.mint)}</span>
           <${Chip} kind=${"src-" + w.source}>${w.source}</${Chip}>
-          ${w.risk || launch?.risk ? html`<span class=${cx("rtag", "lvl-" + lvl)}>${Math.round((w.risk || launch.risk).score)}</span>` : null}
+          <span class=${cx("rtag", "lvl-" + lvl)} title=${lvl === "unknown" ? "risk unknown: armed by hand, no launch data" : `${lvl} risk`}>${lvl === "unknown" ? "?" : riskScore(w.risk || launch?.risk)}</span>
         </div>
         <div class="wsub">armed ${fmtAge(Date.now() - w.armedAt)} ago</div>
       </div>
-      <div class=${cx("pnl", pnl >= 0 ? "g" : "r")}>${fmtPct(pnl, true)}</div>
+      <div class="pnlbox" title="price change since the tripwire was armed">
+        <div class=${cx("pnl", pnl >= 0 ? "g" : "r")}>${fmtPct(pnl, true)}</div>
+        <div class="pnl-lbl">since armed</div>
+      </div>
     </div>
     <div class="w2">
       <div class="px"><span>entry</span>${fmtPrice(w.entryPrice)}<span class="arrow">→</span><b class=${w.price >= w.entryPrice ? "g" : "r"}>${fmtPrice(w.price)}</b></div>
@@ -642,7 +705,7 @@ function WatchCard({ w, launch }) {
     </div>
     <div class=${cx("w3", w.lastAlert && "has", w.lastAlert?.severity)}>
       ${w.alerts > 0
-        ? html`<span class="acount">${w.alerts}</span><span class="atitle">${w.lastAlert?.title || "alert"}</span>`
+        ? html`<span class="acount" title=${plural(w.alerts, "alert")}>${w.alerts}</span><span class="atitle">${w.lastAlert?.title || "alert"}</span>`
         : html`<span class="quiet">tripwire quiet · no insider activity</span>`}
     </div>
     <div class="w4" onClick=${(e) => e.stopPropagation()}>
@@ -662,7 +725,7 @@ function Tripwires() {
   const list = [...store.watches.values()].sort((a, b) => recent(b) - recent(a) || (b.lastAlert?.t || b.armedAt) - (a.lastAlert?.t || a.armedAt));
   return html`<section class="panel wires">
     <div class="ph">
-      <h2>Tripwires <small>${list.length} armed</small></h2>
+      <h2>Tripwires <small>${fmtInt(list.length)} armed</small></h2>
     </div>
     <${ArmForm} />
     <div class="pb list">
@@ -677,6 +740,15 @@ function Tripwires() {
 // ---------------------------------------------------------------------------
 const RULE_LABEL = { dev_sell: "dev sell", cohort_dump: "cohort dump", dev_transfer: "dev transfer", lp_pull: "LP pull", crash: "crash", whale_sell: "whale sell" };
 
+// Price move after the alert: 5m once known, else 1m. Max drop only in the tooltip.
+function MoveChip({ a }) {
+  const which = ok(a.move5m) ? ["5m", a.move5m] : ok(a.move1m) ? ["1m", a.move1m] : null;
+  if (!which) return null;
+  const [lbl, v] = which;
+  const tip = ok(a.avoidedPct) ? `max drop within 10 min: ${MINUS}${a.avoidedPct.toFixed(1)}%` : "price move after the alert";
+  return html`<span class=${cx("move", v < 0 ? "down" : "up")} key=${lbl} title=${tip}>${lbl}: <b>${fmtPct(v, true).replace(/\.\d%$/, "%")}</b></span>`;
+}
+
 function AlertItem({ a }) {
   const fresh = a.t > BOOT_T - 1500 && Date.now() - a.t < 8000;
   return html`<div class=${cx("alert", a.severity, fresh && "fresh")} onClick=${() => { store.openMint = a.mint; bump(); }}>
@@ -688,8 +760,9 @@ function AlertItem({ a }) {
     <div class="adetail">${a.detail}</div>
     <div class="a3">
       <span class=${cx("rule", a.rule)}>${RULE_LABEL[a.rule] || a.rule}</span>
-      ${ok(a.detectMs) ? html`<span class="caught">caught in <b>${fmtMs(a.detectMs)}</b></span>` : null}
-      ${ok(a.avoidedPct) && a.avoidedPct > 0.05 ? html`<span class="avoided" key=${Math.round(a.avoidedPct)}>avoided <b>${MINUS}${a.avoidedPct.toFixed(1)}%</b></span>` : null}
+      ${ok(a.detectMs) ? html`<span class="caught" title="processing latency: slot first seen on the stream → alert"><b>${fmtMs(a.detectMs)}</b></span>` : null}
+      <${MoveChip} a=${a} />
+      ${a.suppressed > 0 ? html`<span class="more" title="further critical triggers folded into this alert (same episode)">+${a.suppressed} more</span>` : null}
       <span class="spacer"></span>
       ${a.signature ? html`<a class="sig" href=${solscanTx(a.signature)} target="_blank" rel="noopener" onClick=${(e) => e.stopPropagation()}>${short(a.signature)} ↗</a>` : null}
     </div>
@@ -697,10 +770,12 @@ function AlertItem({ a }) {
 }
 
 function Alerts() {
-  const crit = store.alerts.filter((a) => a.severity === "critical").length;
+  const st = store.health?.stats;
+  const total = st?.alertsFired ?? store.alerts.length;
+  const crit = st?.criticalAlerts ?? store.alerts.filter((a) => a.severity === "critical").length;
   return html`<section class="panel alerts">
     <div class="ph">
-      <h2>Alerts <small>${store.alerts.length} · <span class="crit-txt">${crit} critical</span></small></h2>
+      <h2>Alerts <small>${fmtInt(total)} · <span class="crit-txt">${fmtInt(crit)} critical</span></small></h2>
       <button class=${cx("mute", !store.muted && "on")} onClick=${toggleMute} title="Beep on critical alerts">
         ${store.muted ? "🔇 muted" : "🔊 sound on"}
       </button>
@@ -721,20 +796,20 @@ function Exits() {
     <div class="pb table-wrap">
       <table>
         <thead><tr>
-          <th>time</th><th>token</th><th>mode</th><th>trigger</th><th>status</th>
-          <th class="num">tokens</th><th class="num">exp. SOL</th><th class="num" title="trigger → send, send → confirmation, slots after alert tx">send → land</th><th>Beam</th><th>tx</th>
+          <th>time</th><th>token</th><th class="col-mode">mode</th><th>trigger</th><th>status</th>
+          <th class="num col-tokens">tokens</th><th class="num">exp. SOL</th><th class="num" title="trigger → send, send → confirmation, slots after alert tx">send → land</th><th>Beam</th><th>tx</th>
         </tr></thead>
         <tbody>
           ${store.exits.length === 0 ? html`<tr><td colspan="10" class="empty">No exits yet. Auto-exit fires on critical alerts; or hit “Exit now”.</td></tr>` : null}
           ${store.exits.map((e) => html`<tr key=${e.id} title=${e.error || ""}>
             <td class="mono dim">${fmtClock(e.t)}</td>
             <td><a class="sym link" onClick=${() => { store.openMint = e.mint; bump(); }}>$${e.symbol}</a></td>
-            <td><span class=${cx("mode-sm", e.mode)}>${e.mode}</span></td>
+            <td class="col-mode"><span class=${cx("mode-sm", e.mode)}>${e.mode}</span></td>
             <td class="trig">${e.trigger}</td>
             <td><span class=${cx("status", e.status)}>${e.status}</span></td>
-            <td class="num mono">${fmtNum(e.tokens)}</td>
+            <td class="num mono col-tokens">${fmtNum(e.tokens)}</td>
             <td class="num mono">${ok(e.expectedSol) ? e.expectedSol.toFixed(3) : "—"}</td>
-            <td class="num mono">${fmtMs(e.sendMs)} <span class="dim">→</span> <b class=${e.landMs ? "g" : ""}>${fmtMs(e.landMs)}</b>${ok(e.slotDelta) ? html`<span class="dim"> +${e.slotDelta}sl</span>` : null}</td>
+            <td class="num mono" title=${ok(e.slotDelta) ? `landed ${plural(e.slotDelta, "slot")} after the alert tx` : ""}>${fmtMs(e.sendMs)} <span class="dim">→</span> <b class=${e.landMs ? "g" : ""}>${fmtMs(e.landMs)}</b>${ok(e.slotDelta) ? html`<span class="dim col-slot"> +${e.slotDelta}sl</span>` : null}</td>
             <td class="mono dim beam">${e.beam ? html`<b>${e.beam.region || "—"}</b>${ok(e.beam.tipLamports) ? ` · tip ${fmtNum(e.beam.tipLamports / 1e3, 0)}k` : ""}${e.beam.landedViaJito ? " · jito" : ""}` : "—"}</td>
             <td class="err">${e.signature ? html`<a class="sig" href=${solscanTx(e.signature)} target="_blank" rel="noopener">${short(e.signature)} ↗</a>` : e.error ? html`<span class="r">${e.error}</span>` : html`<span class="dim">—</span>`}</td>
           </tr>`)}
@@ -764,10 +839,10 @@ function Health() {
         ${row("calls", fmtInt(b.calls))}
         ${row("errors", fmtInt(b.errors), b.errors > 0 ? "warn" : "")}
         ${row("avg latency", b.enabled ? fmtMs(b.avgMs) : "disabled")}
-        ${row("RPC", hl.rpc.ok ? "ok" : "error", hl.rpc.ok ? "g" : "r")}
+        ${row("RPC", hl.rpc.ok ? "ok" : "off", hl.rpc.ok ? "g" : "dim")}
       </div>
       <div class="hcol">
-        <div class="hhead"><i class=${cx("dot", bm.failed > 0 && !bm.landed ? "warn" : "ok")}></i>Beam tx landing</div>
+        <div class="hhead"><i class=${cx("dot", !bm.sent ? "idle" : bm.failed > 0 && !bm.landed ? "warn" : "ok")}></i>Beam tx landing</div>
         ${row("sent", fmtInt(bm.sent))}
         ${row("landed", fmtInt(bm.landed), "g")}
         ${row("failed", fmtInt(bm.failed), bm.failed ? "r" : "")}
@@ -822,7 +897,7 @@ function Drawer({ mint }) {
             <button class="icon" onClick=${copy} title="Copy mint">⧉</button>
           </div>
           <div class="dcreator">creator <a href=${solscanAcct(d?.creator)} target="_blank" rel="noopener" class="mono">${short(d?.creator)}</a>
-            ${d ? html`· age ${fmtAge(Date.now() - d.createdAt)} · ${d.trades} trades · ${d.volumeSol?.toFixed(1)} SOL vol` : null}
+            ${d ? html`· age ${fmtAge(Date.now() - d.createdAt)} · ${plural(d.trades, "trade")} · ${d.volumeSol?.toFixed(1)} SOL vol` : null}
           </div>
         </div>
         <button class="icon close" onClick=${close} title="Close (Esc)">✕</button>
@@ -847,7 +922,7 @@ function Drawer({ mint }) {
               <div><span class="k">mcap</span><b>${fmtUsd(d.mcapUsd)}</b></div>
               <div><span class="k">ATH</span><b class="mono">${fmtPrice(d.athPrice)}</b></div>
               <div><span class="k">bonding</span><b>${d.migrated ? "migrated" : `${Math.round(d.progress)}%`}</b></div>
-              ${w ? html`<div><span class="k">paper PnL</span><b class=${w.pnlPct >= 0 ? "g" : "r"}>${fmtPct(w.pnlPct, true)}</b></div>` : null}
+              ${w ? html`<div><span class="k">since armed</span><b class=${w.pnlPct >= 0 ? "g" : "r"}>${fmtPct(w.pnlPct, true)}</b></div>` : null}
             </div>
             <${PriceChart} data=${d.spark} entry=${w?.entryPrice} />
           </div>
@@ -871,7 +946,7 @@ function Drawer({ mint }) {
             <h3>Alerts on this token</h3>
             ${alertsForMint.map((a) => html`<div class=${cx("dalert", a.severity)}>
               <span class="mono dim">${fmtClock(a.t)}</span><b>${a.title}</b>
-              ${ok(a.avoidedPct) ? html`<span class="avoided">avoided <b>${MINUS}${a.avoidedPct.toFixed(1)}%</b></span>` : null}
+              <span class="spacer"></span><${MoveChip} a=${a} />
             </div>`)}
           </div>` : null}
 

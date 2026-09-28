@@ -6,7 +6,7 @@
 import type { Launch } from "./tracker.js";
 import { held } from "./tracker.js";
 
-export type Level = "low" | "medium" | "high" | "critical";
+export type Level = "unknown" | "low" | "medium" | "high" | "critical";
 
 export interface RiskFlag {
   id: string;
@@ -56,6 +56,7 @@ export interface ExternalIntel {
   fundedByDev?: boolean;
 }
 
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const pct = (part: number, whole: number) => (whole > 0 ? (part / whole) * 100 : 0);
 
 export function computeMetrics(l: Launch): RiskMetrics {
@@ -113,11 +114,13 @@ export function scoreLaunch(l: Launch): RiskReport {
     flags.push({ id, severity, weight, detail });
   const f1 = (n: number) => n.toFixed(1);
 
-  if (m.bundlerPct >= 10) add("bundled", "danger", 30, `${m.bundlers} wallets bought ${f1(m.bundlerPct)}% in the creation slot`);
-  else if (m.bundlerPct >= 3) add("bundled", "warning", 15, `${m.bundlers} wallets bought ${f1(m.bundlerPct)}% in the creation slot`);
+  const sameSlot = `${plural(m.bundlers, "same-slot buyer")} took ${f1(m.bundlerPct)}% in the creation slot`;
+  if (m.bundlerPct >= 10) add("bundled", "danger", 30, sameSlot);
+  else if (m.bundlerPct >= 3) add("bundled", "warning", 15, sameSlot);
 
-  if (m.sniperPct >= 20) add("sniped", "danger", 20, `${m.snipers} snipers took ${f1(m.sniperPct)}% within the first slots`);
-  else if (m.sniperPct >= 8) add("sniped", "warning", 10, `${m.snipers} snipers took ${f1(m.sniperPct)}% within the first slots`);
+  const sniped = `${plural(m.snipers, "sniper")} took ${f1(m.sniperPct)}% within 5 slots`;
+  if (m.sniperPct >= 20) add("sniped", "danger", 20, sniped);
+  else if (m.sniperPct >= 8) add("sniped", "warning", 10, sniped);
 
   if (m.devInitialPct >= 10) add("dev_bag", "warning", 15, `dev bought ${f1(m.devInitialPct)}% of supply at launch`);
 
@@ -125,7 +128,10 @@ export function scoreLaunch(l: Launch): RiskReport {
   else if (m.devSoldPct >= 10) add("dev_selling", "warning", 12, `dev has sold ${f1(m.devSoldPct)}% of their bag`);
 
   if (m.devTransferredPct >= 0.5)
-    add("dev_moved", "danger", 20, `dev moved ${f1(m.devTransferredPct)}% of supply to ${l.devRecipients.size} other wallet(s)`);
+    add("dev_moved", "danger", 20, `dev moved ${f1(m.devTransferredPct)}% of supply to ${plural(l.devRecipients.size, "other wallet")}`);
+
+  if (l.creatorLaunches >= 3) add("serial_launcher", "danger", 20, `creator launched ${l.creatorLaunches} tokens since Tripwire started`);
+  if (l.airdrop) add("airdrop", "info", 0, "dev sent tokens to 50+ wallets (airdrop); only the first 50 are followed");
 
   if (m.insiderHeldPct >= 25) add("insiders_hold", "danger", 20, `dev, bundlers and snipers still hold ${f1(m.insiderHeldPct)}%`);
   else if (m.insiderHeldPct >= 12) add("insiders_hold", "warning", 10, `dev, bundlers and snipers still hold ${f1(m.insiderHeldPct)}%`);
@@ -138,7 +144,7 @@ export function scoreLaunch(l: Launch): RiskReport {
     if (x.mintAuthority) add("mint_authority", "danger", 25, "mint authority is not revoked");
     if (x.freezeAuthority) add("freeze_authority", "danger", 25, "freeze authority is not revoked");
     if (x.top10Pct !== undefined && x.top10Pct >= 50) add("concentrated", "warning", 10, `top 10 holders own ${f1(x.top10Pct)}%`);
-    if (x.devTokensLaunched !== undefined && x.devTokensLaunched >= 10) {
+    if (x.devTokensLaunched !== undefined && x.devTokensLaunched >= 10 && !flags.some((f) => f.id === "serial_launcher")) {
       const rate = pct(x.devMigrated ?? 0, x.devTokensLaunched);
       if (rate < 5) add("serial_launcher", "danger", 20, `dev launched ${x.devTokensLaunched} tokens, ${x.devMigrated ?? 0} ever graduated`);
     }
@@ -152,6 +158,8 @@ export function scoreLaunch(l: Launch): RiskReport {
   }
 
   const score = Math.min(100, flags.reduce((s, f) => s + f.weight, 0));
-  const level: Level = score >= 70 ? "critical" : score >= 45 ? "high" : score >= 20 ? "medium" : "low";
+  // A hand-armed token with no launch history and no Blur data: we simply don't know.
+  const unknown = l.adopted && !x && l.trades < 5;
+  const level: Level = unknown ? "unknown" : score >= 70 ? "critical" : score >= 45 ? "high" : score >= 20 ? "medium" : "low";
   return { score, level, flags, metrics: m };
 }

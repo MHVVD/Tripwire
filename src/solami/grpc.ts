@@ -61,6 +61,11 @@ export class GrpcFeed extends EventEmitter<GrpcFeedEvents> {
   private resubTimer?: NodeJS.Timeout;
   private slotSeen = new Map<number, number>();
   private lags: number[] = [];
+  /** Recently seen signatures: slot replay after a reconnect re-delivers transactions. */
+  private seenSigs = new Set<string>();
+  private prevSigs = new Set<string>();
+  private connectedAt = 0;
+  private replayFailed = false;
   private win = { tx: 0, msg: 0 };
   readonly status: GrpcStatus = {
     connected: false,
@@ -151,18 +156,22 @@ export class GrpcFeed extends EventEmitter<GrpcFeedEvents> {
     if (this.stopped) return;
     try {
       const client = new Client(this.url, this.token, { grpcMaxDecodingMessageSize: 64 * 1024 * 1024 });
-      await client.connect();
-      const stream = await client.subscribe();
+      const timeout = <T,>(p: Promise<T>) =>
+        Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error("connect timeout")), 10_000))]);
+      await timeout(client.connect());
+      const stream = await timeout(client.subscribe());
       this.stream = stream;
       stream.on("data", (d: Record<string, unknown>) => this.onData(d));
       stream.on("error", (e: Error) => this.fail(e));
       stream.on("end", () => this.fail(new Error("stream ended")));
-      // Replay a small window before the last processed slot to close the reconnect gap.
-      const from = this.lastSlot ? this.lastSlot - 2 : undefined;
+      // Replay from just before the last processed slot to close the reconnect gap. If a
+      // replay was already refused (slot too old for the server), resume live instead.
+      const from = this.lastSlot && !this.replayFailed ? this.lastSlot - 2 : undefined;
       this.writeRequest(from);
       this.status.replayedFromSlot = from;
       this.status.connected = true;
       this.lastDataAt = Date.now();
+      this.connectedAt = Date.now();
       this.emit("status", this.status);
     } catch (e) {
       this.fail(e as Error);
@@ -175,12 +184,17 @@ export class GrpcFeed extends EventEmitter<GrpcFeedEvents> {
     this.failing = true;
     this.status.connected = false;
     this.status.lastError = e.message;
+    // A replay that dies immediately is likely out of retention: skip it next time.
+    this.replayFailed = !!this.status.replayedFromSlot && Date.now() - this.connectedAt < 5000;
+    // A connection that stayed healthy for a minute resets the backoff.
+    if (this.connectedAt && Date.now() - this.connectedAt > 60_000) this.attempt = 0;
     this.emit("error", e);
     this.emit("status", this.status);
     this.stream?.removeAllListeners();
     this.stream?.destroy();
     this.stream = undefined;
-    const delay = Math.min(15_000, 500 * 2 ** Math.min(this.status.reconnects, 5));
+    const delay = Math.min(15_000, 500 * 2 ** Math.min(this.attempt, 5));
+    this.attempt++;
     this.status.reconnects++;
     setTimeout(() => {
       this.failing = false;
@@ -188,7 +202,18 @@ export class GrpcFeed extends EventEmitter<GrpcFeedEvents> {
     }, delay);
   }
 
+  private attempt = 0;
+
   private onData(d: Record<string, unknown>): void {
+    try {
+      this.handle(d);
+    } catch (e) {
+      // Never let one odd transaction tear the stream down.
+      this.emit("error", new Error(`dropped update: ${(e as Error).message}`));
+    }
+  }
+
+  private handle(d: Record<string, unknown>): void {
     const now = Date.now();
     this.lastDataAt = now;
     this.win.msg++;
@@ -208,6 +233,12 @@ export class GrpcFeed extends EventEmitter<GrpcFeedEvents> {
     if (!d.transaction) return;
     const tx = decodeTx(d as RawTxUpdate);
     if (!tx) return;
+    if (this.seenSigs.has(tx.signature) || this.prevSigs.has(tx.signature)) return;
+    this.seenSigs.add(tx.signature);
+    if (this.seenSigs.size >= 100_000) {
+      this.prevSigs = this.seenSigs;
+      this.seenSigs = new Set();
+    }
     this.win.tx++;
     this.status.txTotal++;
     if (tx.slot > this.lastSlot) {

@@ -86,11 +86,12 @@ export class Exiter {
     const owner = this.opts.wallet?.publicKey;
     if (!owner) return undefined;
     const res = await this.beam.connection.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(mint) });
+    // Jupiter sells from one account (the ATA); take the largest rather than the sum.
     let raw = 0n;
     let decimals = 6;
     for (const a of res.value) {
       const info = a.account.data.parsed.info.tokenAmount as { amount: string; decimals: number };
-      raw += BigInt(info.amount);
+      if (BigInt(info.amount) > raw) raw = BigInt(info.amount);
       decimals = info.decimals;
     }
     return { raw, decimals };
@@ -103,7 +104,7 @@ export class Exiter {
     return (await res.json()) as Record<string, unknown>;
   }
 
-  private async buildTx(quote: Record<string, unknown>): Promise<VersionedTransaction> {
+  private async buildTx(quote: Record<string, unknown>): Promise<{ tx: VersionedTransaction; lastValidBlockHeight: number }> {
     const wallet = this.opts.wallet!;
     const res = await fetch(`${this.opts.jupiterApi}/swap-instructions`, {
       method: "POST",
@@ -119,7 +120,7 @@ export class Exiter {
       addressLookupTableAddresses: string[];
     };
     const conn = this.beam.connection;
-    const [tip, { blockhash }, alts] = await Promise.all([
+    const [tip, { blockhash, lastValidBlockHeight }, alts] = await Promise.all([
       this.beam.tipInstruction(wallet.publicKey, this.opts.tipLamports),
       conn.getLatestBlockhash("confirmed"),
       Promise.all(j.addressLookupTableAddresses.map((a) => conn.getAddressLookupTable(new PublicKey(a)).then((r) => r.value))),
@@ -137,7 +138,7 @@ export class Exiter {
     );
     const tx = new VersionedTransaction(msg);
     tx.sign([wallet]);
-    return tx;
+    return { tx, lastValidBlockHeight };
   }
 
   /**
@@ -172,8 +173,8 @@ export class Exiter {
       } else if (this.opts.mode === "live") {
         throw new Error("wallet holds none of this token");
       } else {
-        const tokens = price > 0 ? this.opts.paperSizeSol / price : 0;
-        raw = BigInt(Math.floor(tokens * 10 ** decimals));
+        if (!(price > 0)) throw new Error("no price for this token yet - nothing to size a paper exit with");
+        raw = BigInt(Math.floor((this.opts.paperSizeSol / price) * 10 ** decimals));
       }
       rec.tokens = Number(raw) / 10 ** decimals;
       const estimate = rec.tokens * price;
@@ -189,7 +190,7 @@ export class Exiter {
 
       if (this.opts.mode === "paper") {
         if (quote && this.opts.wallet && bal && bal.raw > 0n) {
-          const tx = await this.buildTx(quote);
+          const { tx } = await this.buildTx(quote);
           const sim = await this.beam.connection.simulateTransaction(tx, { sigVerify: false });
           if (sim.value.err) throw new Error(`simulation failed: ${JSON.stringify(sim.value.err)}`);
         }
@@ -199,9 +200,9 @@ export class Exiter {
 
       const expected = rec.expectedSol ?? estimate;
       if (expected > this.opts.maxSol) throw new Error(`exit worth ${expected.toFixed(3)} SOL exceeds EXIT_MAX_SOL=${this.opts.maxSol}`);
-      const tx = await this.buildTx(quote!);
+      const { tx, lastValidBlockHeight } = await this.buildTx(quote!);
       update({ status: "sending", sendMs: Date.now() - t0 });
-      const landed = await this.beam.sendAndConfirm(tx.serialize());
+      const landed = await this.beam.sendAndConfirm(tx.serialize(), lastValidBlockHeight);
       update({
         status: "landed",
         signature: landed.signature,
