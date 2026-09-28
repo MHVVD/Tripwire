@@ -48,29 +48,53 @@ export class Beam {
     return SystemProgram.transfer({ fromPubkey: from, toPubkey: to, lamports });
   }
 
-  /** Send a signed, tipped transaction and wait for it to land. */
-  async sendAndConfirm(raw: Uint8Array, timeoutMs = 30_000): Promise<{ signature: string; landMs: number; slot?: number }> {
+  /**
+   * Send a signed, tipped transaction and wait for it to land. Re-sends every 2s (the
+   * same signature, so it can only land once) until it confirms or its blockhash
+   * expires; a failed status poll is retried rather than treated as a failure.
+   */
+  async sendAndConfirm(raw: Uint8Array, lastValidBlockHeight: number): Promise<{ signature: string; landMs: number; slot?: number }> {
     const t0 = Date.now();
-    const signature = await this.connection.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 });
+    const send = () => this.connection.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 });
+    const signature = await send();
     this.status.sent++;
-    while (Date.now() - t0 < timeoutMs) {
-      const { value } = await this.connection.getSignatureStatuses([signature]);
-      const s = value[0];
-      if (s?.err) {
-        this.status.failed++;
-        throw Object.assign(new Error(`transaction failed: ${JSON.stringify(s.err)}`), { signature });
-      }
-      if (s && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) {
-        const landMs = Date.now() - t0;
-        this.status.landed++;
-        this.landTotal += landMs;
-        this.status.avgLandMs = Math.round(this.landTotal / this.status.landed);
-        return { signature, landMs, slot: s.slot };
-      }
+    let lastSend = Date.now();
+    let lastHeightCheck = 0;
+    for (;;) {
       await new Promise((r) => setTimeout(r, 300));
+      try {
+        const { value } = await this.connection.getSignatureStatuses([signature]);
+        const s = value[0];
+        if (s?.err) {
+          this.status.failed++;
+          throw Object.assign(new Error(`transaction failed on-chain: ${JSON.stringify(s.err)}`), { signature, final: true });
+        }
+        if (s && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) {
+          const landMs = Date.now() - t0;
+          this.status.landed++;
+          this.landTotal += landMs;
+          this.status.avgLandMs = Math.round(this.landTotal / this.status.landed);
+          return { signature, landMs, slot: s.slot };
+        }
+        if (Date.now() - lastHeightCheck > 2000) {
+          lastHeightCheck = Date.now();
+          if ((await this.connection.getBlockHeight("confirmed")) > lastValidBlockHeight) {
+            this.status.failed++;
+            throw Object.assign(new Error("blockhash expired before the transaction landed"), { signature, final: true });
+          }
+        }
+        if (Date.now() - lastSend > 2000) {
+          lastSend = Date.now();
+          await send().catch(() => undefined);
+        }
+      } catch (e) {
+        if ((e as { final?: boolean }).final) throw e;
+        if (Date.now() - t0 > 120_000) {
+          this.status.failed++;
+          throw Object.assign(new Error(`gave up confirming: ${(e as Error).message}`), { signature });
+        }
+      }
     }
-    this.status.failed++;
-    throw Object.assign(new Error("not confirmed within timeout"), { signature });
   }
 
   /** Beam's own record of a send: region, Jito path, tip, time held. */

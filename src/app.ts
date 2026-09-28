@@ -8,7 +8,7 @@
  *   Solami Blur REST ──► enrichment of launches worth a closer look
  */
 import { EventEmitter } from "node:events";
-import { Connection } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 import type { Config } from "./config.js";
 import { GrpcFeed } from "./solami/grpc.js";
 import { BlurClient } from "./solami/blur.js";
@@ -19,7 +19,8 @@ import { Exiter, parseSecretKey, type ExitRecord } from "./engine/exit.js";
 import { Notifier } from "./notify.js";
 import type { DecodedTx } from "./engine/decode.js";
 
-const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const MAX_EXIT_ATTEMPTS = 3;
 const median = (xs: number[]) => {
   if (!xs.length) return 0;
   const s = [...xs].sort((a, b) => a - b);
@@ -50,6 +51,8 @@ export class App extends EventEmitter<AppEvents> {
   private readonly rpc: Connection;
   private readonly startedAt = Date.now();
   private launchesSeen = 0;
+  private alertsFired = 0;
+  private criticalFired = 0;
   private solUsd = 0;
   private chainSlot?: number;
   private rpcOk = false;
@@ -75,12 +78,15 @@ export class App extends EventEmitter<AppEvents> {
         tipLamports: cfg.BEAM_TIP_LAMPORTS,
         priorityMicroLamports: cfg.PRIORITY_FEE_MICROLAMPORTS,
         jupiterApi: cfg.JUPITER_API,
-        paperSizeSol: 0.1,
+        paperSizeSol: cfg.PAPER_SIZE_SOL,
       },
       (r) => this.onExit(r),
     );
     this.notifier = new Notifier(cfg);
-    this.tracker.onEvict = (mint) => this.emit("launch_removed", { mint });
+    this.tracker.onEvict = (mint) => {
+      this.enriched.delete(mint);
+      this.emit("launch_removed", { mint });
+    };
   }
 
   async start(): Promise<void> {
@@ -93,6 +99,8 @@ export class App extends EventEmitter<AppEvents> {
       setInterval(() => void this.pollChainSlot(), 2000),
       setInterval(() => void this.pollRpc(), 15_000),
       setInterval(() => void this.pollSolUsd(), 60_000),
+      setInterval(() => this.followAll(), 5000),
+      setInterval(() => this.sampleBaseline(), 30_000),
     );
     void this.pollChainSlot();
     void this.pollRpc();
@@ -107,9 +115,6 @@ export class App extends EventEmitter<AppEvents> {
   // ---- ingest ---------------------------------------------------------------
 
   private onTx(tx: DecodedTx, now: number): void {
-    const usdc = tx.prices[USDC];
-    if (usdc && usdc > 0.0005 && usdc < 0.05) this.solUsd = 1 / usdc;
-
     const updates = this.tracker.ingest(tx, now);
     for (const u of updates) {
       if (u.created) this.launchesSeen++;
@@ -123,30 +128,66 @@ export class App extends EventEmitter<AppEvents> {
   private onWatchedUpdate(w: Watch, u: TrackerUpdate, now: number): void {
     const before = u.launch.devRecipients.size;
     const fired = evaluate(w, u, now, this.feed.slotFirstSeen(u.tx.slot));
-    followUp(w, u.launch, now);
-    for (const a of w.alerts) {
-      if (a.t < now && now <= a.followUntil && a.avoidedPct !== undefined) this.emitAlertUpdate(a);
-    }
+    for (const a of followUp(w, u.launch, now)) if (!fired.includes(a)) this.emitAlertUpdate(a);
     for (const a of fired) {
       this.alerts.unshift(a);
       if (this.alerts.length > 500) this.alerts.pop();
+      this.alertsFired++;
+      if (a.severity === "critical") this.criticalFired++;
       this.emit("alert", a);
       void this.notifier.alert(a, u.launch);
-      if (a.severity === "critical" && w.autoExit && !w.exitedAt) {
-        w.exitedAt = now;
-        void this.exiter.exit(w.mint, a.symbol, a.title, u.launch.price, a.slot);
-      }
+      if (a.severity === "critical") this.autoExit(w, a, u.launch.price);
     }
     if (u.launch.devRecipients.size !== before) this.syncSubscriptions();
     this.emit("watch", this.watchView(w));
   }
 
-  private lastAlertEmit = new Map<string, number>();
+  /** One auto-exit per watch; a failed attempt (slippage in the dump, timeout) is retried on the next critical alert. */
+  private autoExit(w: Watch, a: Alert, price: number): void {
+    if (!w.autoExit || w.exitedAt || (w.exitAttempts ?? 0) >= MAX_EXIT_ATTEMPTS) return;
+    w.exitedAt = Date.now();
+    w.exitAttempts = (w.exitAttempts ?? 0) + 1;
+    void this.exiter.exit(w.mint, a.symbol, a.title, price, a.slot).then((r) => {
+      if (r.status === "failed") w.exitedAt = undefined;
+    });
+  }
+
+  private lastAlertEmit = new WeakMap<Alert, number>();
   private emitAlertUpdate(a: Alert): void {
-    const last = this.lastAlertEmit.get(a.id) ?? 0;
-    if (Date.now() - last < 1000) return;
-    this.lastAlertEmit.set(a.id, Date.now());
+    const last = this.lastAlertEmit.get(a) ?? 0;
+    if (Date.now() - last < 1000 && a.move5m === undefined) return;
+    this.lastAlertEmit.set(a, Date.now());
     this.emit("alert_update", a);
+  }
+
+  /** Alerts on tokens that stopped trading still need their +1m/+5m outcome. */
+  private followAll(): void {
+    const now = Date.now();
+    for (const w of this.watches.values()) {
+      const l = this.tracker.get(w.mint);
+      if (l) for (const a of followUp(w, l, now)) this.emitAlertUpdate(a);
+    }
+  }
+
+  /**
+   * Baseline for the outcome stat: every 30s, note each watched token's price; five
+   * minutes later, record how it moved. Critical alerts are compared against this.
+   */
+  private baselinePending: { mint: string; t: number; p: number }[] = [];
+  private baselineMoves: number[] = [];
+  private sampleBaseline(): void {
+    const now = Date.now();
+    for (const w of this.watches.values()) {
+      const l = this.tracker.get(w.mint);
+      if (l && l.price > 0) this.baselinePending.push({ mint: w.mint, t: now, p: l.price });
+    }
+    const due = this.baselinePending.filter((b) => now - b.t >= 5 * 60_000);
+    this.baselinePending = this.baselinePending.filter((b) => now - b.t < 5 * 60_000).slice(-5000);
+    for (const b of due) {
+      const l = this.tracker.get(b.mint);
+      if (l && l.price > 0) this.baselineMoves.push((l.price / b.p - 1) * 100);
+    }
+    if (this.baselineMoves.length > 5000) this.baselineMoves.splice(0, this.baselineMoves.length - 5000);
   }
 
   private maybeAutoWatch(l: Launch, now: number): void {
@@ -162,7 +203,7 @@ export class App extends EventEmitter<AppEvents> {
       if (!quietest || now - quietest.last < 60_000) return;
       this.disarm(quietest.w.mint);
     }
-    this.arm(l.mint, { source: "auto" });
+    this.arm(l.mint, { source: "auto", autoExit: c.AUTO_WATCH_AUTO_EXIT });
   }
 
   // ---- watches ---------------------------------------------------------------
@@ -172,16 +213,9 @@ export class App extends EventEmitter<AppEvents> {
     let l = this.tracker.get(mint);
     if (!l) {
       l = this.tracker.adopt(mint, { creator: opts.devWallet }, now);
-      void this.blur.creation(mint).then((c) => {
-        if (!c || !l) return;
-        l.creator ||= c.creator ?? "";
-        l.symbol ||= c.symbol ?? "";
-        l.name ||= c.name ?? "";
-        this.syncSubscriptions();
-        this.dirty.add(mint);
-      });
-    } else if (opts.devWallet && !l.creator) {
-      l.creator = opts.devWallet;
+      void this.describeAdopted(mint);
+    } else if (opts.devWallet) {
+      this.tracker.describe(mint, { creator: opts.devWallet });
     }
     let w = this.watches.get(mint);
     if (!w) {
@@ -197,6 +231,23 @@ export class App extends EventEmitter<AppEvents> {
     void this.enrich(l);
     this.emit("watch", this.watchView(w));
     return w;
+  }
+
+  /** Fill in creator, name and real supply for a token Tripwire did not see launch. */
+  private async describeAdopted(mint: string): Promise<void> {
+    const [creation, supply] = await Promise.all([
+      this.blur.creation(mint),
+      this.rpc.getTokenSupply(new PublicKey(mint)).then((r) => r.value).catch(() => undefined),
+    ]);
+    this.tracker.describe(mint, {
+      creator: creation?.creator,
+      name: creation?.name,
+      symbol: creation?.symbol,
+      supplyRaw: supply ? Number(supply.amount) : undefined,
+      decimals: supply?.decimals,
+    });
+    this.syncSubscriptions();
+    this.dirty.add(mint);
   }
 
   disarm(mint: string): void {
@@ -223,7 +274,7 @@ export class App extends EventEmitter<AppEvents> {
       accounts.add(mint);
       const l = this.tracker.get(mint);
       if (!l) continue;
-      if (l.creator) accounts.add(l.creator);
+      for (const d of l.devWallets) accounts.add(d);
       for (const r of l.devRecipients) accounts.add(r);
     }
     this.feed.setWatched(accounts);
@@ -286,6 +337,8 @@ export class App extends EventEmitter<AppEvents> {
       volumeSol: l.volumeSol,
       risk: l.risk,
       enriched: !!l.external,
+      adopted: !!l.adopted,
+      supply: l.supplyRaw / 10 ** l.decimals,
       watched: this.watches.has(l.mint),
       spark,
     };
@@ -323,6 +376,7 @@ export class App extends EventEmitter<AppEvents> {
   health() {
     const g = this.feed.status;
     const settled = this.alerts.filter((a) => Date.now() - a.t > 30_000 && a.avoidedPct !== undefined);
+    const alertMoves = this.alerts.filter((a) => a.severity === "critical" && a.move5m !== undefined).map((a) => a.move5m!);
     const detect = this.alerts.map((a) => a.detectMs).filter((x): x is number => x !== undefined);
     return {
       uptimeSec: Math.round((Date.now() - this.startedAt) / 1000),
@@ -337,10 +391,14 @@ export class App extends EventEmitter<AppEvents> {
         launchesSeen: this.launchesSeen,
         tracked: this.tracker.launches.size,
         watches: this.watches.size,
-        alertsFired: this.alerts.length,
-        criticalAlerts: this.alerts.filter((a) => a.severity === "critical").length,
+        alertsFired: this.alertsFired,
+        criticalAlerts: this.criticalFired,
         medianAvoidedPct: median(settled.filter((a) => a.severity === "critical").map((a) => a.avoidedPct!)),
         medianDetectMs: median(detect),
+        alertMove5m: alertMoves.length ? median(alertMoves) : null,
+        baselineMove5m: this.baselineMoves.length ? median(this.baselineMoves) : null,
+        alertSamples: alertMoves.length,
+        baselineSamples: this.baselineMoves.length,
       },
     };
   }
@@ -388,15 +446,15 @@ export class App extends EventEmitter<AppEvents> {
   }
 
   private async pollSolUsd(): Promise<void> {
-    if (this.solUsd) return;
     try {
-      const res = await fetch("https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112", { signal: AbortSignal.timeout(4000) });
+      const res = await fetch(`https://lite-api.jup.ag/price/v3?ids=${SOL_MINT}`, { signal: AbortSignal.timeout(4000) });
       const j = (await res.json()) as Record<string, { usdPrice: number }>;
-      const p = j["So11111111111111111111111111111111111111112"]?.usdPrice;
-      if (p) this.solUsd = p;
+      const p = j[SOL_MINT]?.usdPrice;
+      if (p && p > 1 && p < 100_000) this.solUsd = p;
     } catch {
-      // The USDC pools on the stream will fill this in shortly anyway.
+      // Keep the last known price; USD figures are cosmetic, SOL figures are exact.
     }
   }
+
 }
 

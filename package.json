@@ -11,6 +11,7 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "doctor": "tsx src/cli/doctor.ts",
+    "capture": "tsx src/cli/capture.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

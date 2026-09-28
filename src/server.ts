@@ -22,23 +22,68 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   let data = "";
   for await (const chunk of req) {
     data += chunk;
-    if (data.length > 10_000) throw new Error("body too large");
+    if (data.length > 10_000) throw new HttpError(413, "body too large");
   }
-  return data ? (JSON.parse(data) as Record<string, unknown>) : {};
+  try {
+    const v = data ? JSON.parse(data) : {};
+    if (typeof v !== "object" || v === null || Array.isArray(v)) throw new Error();
+    return v as Record<string, unknown>;
+  } catch {
+    throw new HttpError(400, "body must be a JSON object");
+  }
 }
 
-export function createServer(app: App): http.Server {
+/**
+ * Blocks other web pages from driving the API: a browser only sends a cross-origin
+ * application/json POST after a CORS preflight, which we never approve, and any Origin
+ * header must match the host we are served from. With a token configured, every API
+ * call must also carry it.
+ */
+function authorize(req: http.IncomingMessage, url: URL, token?: string): void {
+  const origin = req.headers.origin;
+  if (origin) {
+    let host = "";
+    try {
+      host = new URL(origin).host;
+    } catch {
+      // malformed origin: rejected below
+    }
+    if (host !== req.headers.host) throw new HttpError(403, "cross-origin request refused");
+  }
+  if (req.method === "POST" && !(req.headers["content-type"] ?? "").startsWith("application/json")) {
+    throw new HttpError(415, "content-type must be application/json");
+  }
+  if (token && req.headers["x-tripwire-token"] !== token && url.searchParams.get("token") !== token) {
+    throw new HttpError(401, "missing or wrong token - open the URL printed in the terminal");
+  }
+}
+
+export function createServer(app: App, opts: { token?: string } = {}): http.Server {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const p = url.pathname;
     try {
+      if (p.startsWith("/api/")) authorize(req, url, opts.token);
       if (p === "/api/stream" && req.method === "GET") {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-        const send = (event: string, data: unknown) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        const send = (event: string, data: unknown) => {
+          // A client that stops reading gets dropped instead of buffering forever.
+          if (res.writableLength > 8 * 1024 * 1024) return res.destroy();
+          res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        };
         send("snapshot", app.snapshot());
         const handlers = STREAMED.map((ev) => {
           const h = (data: unknown) => send(ev, data);
@@ -62,11 +107,13 @@ export function createServer(app: App): http.Server {
         const devWallet = body.devWallet ? String(body.devWallet).trim() : undefined;
         if (!BASE58.test(mint)) return json(res, 400, { error: "mint must be a base58 address" });
         if (devWallet && !BASE58.test(devWallet)) return json(res, 400, { error: "devWallet must be a base58 address" });
-        const w = app.arm(mint, { source: "manual", autoExit: body.autoExit === true, devWallet });
+        const autoExit = typeof body.autoExit === "boolean" ? body.autoExit : undefined;
+        const w = app.arm(mint, { source: "manual", autoExit, devWallet });
         return json(res, 200, app.watchView(w));
       }
       const watchMatch = p.match(/^\/api\/watch\/([^/]+)$/);
       if (watchMatch && req.method === "DELETE") {
+        if (!BASE58.test(watchMatch[1])) return json(res, 400, { error: "bad mint" });
         app.disarm(watchMatch[1]);
         return json(res, 200, { ok: true });
       }
@@ -85,7 +132,9 @@ export function createServer(app: App): http.Server {
       res.writeHead(200, { "content-type": TYPES[path.extname(file)] ?? "application/octet-stream" });
       res.end(body);
     } catch (e) {
-      json(res, 500, { error: (e as Error).message });
+      if (e instanceof HttpError) return json(res, e.status, { error: e.message });
+      console.warn(`[http] ${req.method} ${p}: ${(e as Error).message}`);
+      json(res, 500, { error: "internal error" });
     }
   });
 }

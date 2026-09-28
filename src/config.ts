@@ -6,11 +6,20 @@ const bool = (def: boolean) =>
     .string()
     .optional()
     .transform((v) => (v === undefined || v === "" ? def : ["1", "true", "yes", "on"].includes(v.toLowerCase())));
-const num = (def: number) =>
+/** A number env var; malformed values (e.g. "0,5") are a startup error, never NaN. */
+const num = (def: number, min = -Infinity, max = Infinity) =>
   z
     .string()
     .optional()
-    .transform((v) => (v === undefined || v === "" ? def : Number(v)));
+    .transform((v, ctx) => {
+      if (v === undefined || v.trim() === "") return def;
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < min || n > max) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `must be a number between ${min} and ${max}, got "${v}"` });
+        return z.NEVER;
+      }
+      return n;
+    });
 
 const schema = z.object({
   SOLAMI_API_KEY: z.string().min(1, "SOLAMI_API_KEY is required - get one at https://solami.dev"),
@@ -20,26 +29,32 @@ const schema = z.object({
   SOLAMI_RPC_KEY: z.string().optional(),
   SOLAMI_REGION: z.enum(["", "nyc", "fra", "ams"]).optional().default(""),
 
-  PORT: num(8787),
+  PORT: num(8787, 1, 65535),
   HOST: z.string().optional().default("127.0.0.1"),
+  /** Required for API access when HOST is not loopback; generated if missing. */
+  TRIPWIRE_TOKEN: z.string().optional(),
 
   /** Follow every pump.fun / PumpSwap launch and score it live. */
   RADAR: bool(true),
   /** Automatically arm tripwires on launches that show traction. */
   AUTO_WATCH: bool(true),
-  AUTO_WATCH_MIN_PROGRESS: num(15),
-  AUTO_WATCH_MIN_BUYERS: num(15),
-  AUTO_WATCH_MAX: num(40),
+  AUTO_WATCH_MIN_PROGRESS: num(15, 0, 100),
+  AUTO_WATCH_MIN_BUYERS: num(15, 0),
+  AUTO_WATCH_MAX: num(40, 0, 500),
+  /** Auto-watched tokens also auto-exit. Defaults on in paper mode, off in live mode. */
+  AUTO_WATCH_AUTO_EXIT: z.string().optional(),
   /** Enrich launches that show traction with Blur REST intel (needs DataApi). */
   BLUR_ENRICH: bool(true),
 
   /** Exits. paper = simulate and log; live = sign and send through Beam. */
   EXIT_MODE: z.enum(["paper", "live"]).optional().default("paper"),
   WALLET_SECRET_KEY: z.string().optional(),
-  EXIT_MAX_SOL: num(0.5),
-  EXIT_SLIPPAGE_BPS: num(1500),
-  BEAM_TIP_LAMPORTS: num(100_000),
-  PRIORITY_FEE_MICROLAMPORTS: num(200_000),
+  EXIT_MAX_SOL: num(0.5, 0),
+  EXIT_SLIPPAGE_BPS: num(1500, 1, 10_000),
+  BEAM_TIP_LAMPORTS: num(100_000, 100_000),
+  PRIORITY_FEE_MICROLAMPORTS: num(200_000, 0),
+  /** Paper position size used to quote paper exits. */
+  PAPER_SIZE_SOL: num(0.1, 0),
   JUPITER_API: z.string().optional().default("https://lite-api.jup.ag/swap/v1"),
 
   TELEGRAM_BOT_TOKEN: z.string().optional(),
@@ -47,7 +62,8 @@ const schema = z.object({
   DISCORD_WEBHOOK_URL: z.string().optional(),
 });
 
-export type Config = z.infer<typeof schema> & {
+export type Config = Omit<z.infer<typeof schema>, "AUTO_WATCH_AUTO_EXIT"> & {
+  AUTO_WATCH_AUTO_EXIT: boolean;
   grpcKey: string;
   dataKey: string;
   rpcKey: string;
@@ -65,8 +81,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const c = parsed.data;
   const r = c.SOLAMI_REGION ? `${c.SOLAMI_REGION}.` : "";
+  const autoExitRaw = c.AUTO_WATCH_AUTO_EXIT?.trim().toLowerCase();
   return {
     ...c,
+    AUTO_WATCH_AUTO_EXIT: autoExitRaw ? ["1", "true", "yes", "on"].includes(autoExitRaw) : c.EXIT_MODE === "paper",
     grpcKey: c.SOLAMI_GRPC_KEY || c.SOLAMI_API_KEY,
     dataKey: c.SOLAMI_DATA_KEY || c.SOLAMI_API_KEY,
     rpcKey: c.SOLAMI_RPC_KEY || c.SOLAMI_API_KEY,
