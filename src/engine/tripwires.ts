@@ -157,7 +157,7 @@ export function evaluate(w: Watch, u: TrackerUpdate, now: number, slotSeenAt?: n
       w.cohortSells.push({ t: now, amount: amt });
     }
 
-    if (f.kind === "sell" && supplyPct >= r.whaleSellPct && !devSide(f.owner)) {
+    if (f.kind === "sell" && supplyPct >= r.whaleSellPct && f.solDelta >= 0.1e9 && !devSide(f.owner)) {
       fire("whale_sell", `Whale sold ${fmt(supplyPct)}% of supply`, `${short(f.owner)} (${l.holders.get(f.owner)?.role ?? "trader"}) sold for ${(f.solDelta / 1e9).toFixed(2)} SOL`, f);
     }
 
