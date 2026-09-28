@@ -1,0 +1,33 @@
+{
+  "name": "tripwire",
+  "version": "0.1.0",
+  "description": "Live rug radar and Beam-powered auto-exit for Solana launches, built on Solami (Blur, Yellowstone gRPC, RPC, Beam).",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "replay": "tsx src/cli/replay.ts",
+    "doctor": "tsx src/cli/doctor.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.99.0",
+    "@triton-one/yellowstone-grpc": "^7.0.1",
+    "bs58": "^6.0.0",
+    "dotenv": "^18.0.4",
+    "tsx": "^4.23.15",
+    "ws": "^8.22.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.2"
+  }
+}
