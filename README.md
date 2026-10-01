@@ -9,7 +9,7 @@ Tripwire watches them for you:
 1. **Launch Radar.** Every pump.fun launch is picked up from Solami's Yellowstone gRPC stream the moment it lands. Tripwire reconstructs its cohorts itself (dev, bundlers, snipers, wallets the dev funds with tokens) and gives it a 0–100 risk score with the reasons spelled out.
 2. **Tripwires.** Arm any token, or let Tripwire auto-arm the ones gaining traction. Rules fire when the dev sells, the dev moves supply to fresh wallets, insiders dump together, liquidity is pulled, a whale exits, or price crashes. Tripwire follows the money: a wallet the dev sends tokens to is treated as the dev.
 3. **Auto-exit via Beam.** On a critical alert, Tripwire can sell your position. It builds the swap from Jupiter's instructions, adds a Beam tip, signs it with your wallet, and lands it through Solami's Beam, then reads Beam's landing record back. Paper mode (the default) quotes and simulates instead.
-4. **Honest proof.** After every alert, Tripwire records the signed price move at +1 and +5 minutes. The dashboard compares the median 5-minute move after critical alerts with a baseline: the same watched tokens sampled at random times. It does not show a cherry-picked "loss avoided" figure.
+4. **Honest proof.** After every alert, Tripwire records the signed price move at +1 and +5 minutes. The dashboard compares the median 5-minute move after critical alerts with a baseline: the same watched tokens sampled at random times. It does not show a cherry-picked "loss avoided" figure. In a first 7-minute mainnet run (2026-10-01, a small sample of n≈6 settled alerts), the median 5-minute move after critical alerts was about −16% to −33%, against −7% to −9% for the baseline.
 
 ### Proof on mainnet
 
