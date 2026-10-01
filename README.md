@@ -9,7 +9,18 @@ Tripwire watches them for you:
 1. **Launch Radar.** Every pump.fun launch is picked up from Solami's Yellowstone gRPC stream the moment it lands. Tripwire reconstructs its cohorts itself (dev, bundlers, snipers, wallets the dev funds with tokens) and gives it a 0–100 risk score with the reasons spelled out.
 2. **Tripwires.** Arm any token, or let Tripwire auto-arm the ones gaining traction. Rules fire when the dev sells, the dev moves supply to fresh wallets, insiders dump together, liquidity is pulled, a whale exits, or price crashes. Tripwire follows the money: a wallet the dev sends tokens to is treated as the dev.
 3. **Auto-exit via Beam.** On a critical alert, Tripwire can sell your position. It builds the swap from Jupiter's instructions, adds a Beam tip, signs it with your wallet, and lands it through Solami's Beam, then reads Beam's landing record back. Paper mode (the default) quotes and simulates instead.
-4. **Proof.** After every alert, Tripwire keeps watching the price and reports the further drop an exit at alert time would have avoided. The dashboard shows the median across all critical alerts.
+4. **Honest proof.** After every alert, Tripwire records the signed price move at +1 and +5 minutes. The dashboard compares the median 5-minute move after critical alerts with a baseline: the same watched tokens sampled at random times. It does not show a cherry-picked "loss avoided" figure.
+
+### Proof on mainnet
+
+`npm run beam-test` buys a tiny position and sells it with Tripwire's real exit code, both sent through Beam. Run on 2026-10-01:
+
+| Step | Result | Transaction |
+|---|---|---|
+| Buy 0.003 SOL of STONK via Jupiter + Beam | landed in 633 ms | [2cYxU6…jwHh7s](https://solscan.io/tx/2cYxU6mQ1NrUheo75jQqRd3ykZJGbvyThVjm1mc2mpaGDLZCG5bsHHYK4kG3YUs5FY2gfMfxts4o7558H4jwHh7s) |
+| Exit via `Exiter.exit()` (live mode) + Beam | trigger → send 380 ms, landed in 544 ms | [2F8nEw…ns8fbPG](https://solscan.io/tx/2F8nEwyBL7Vz1BCqqutR2Ec9P7EBkgUsPUVAUK7Em3d2dvBN9CEudjqekqhyBmo9c1RtwnvDRwehzv1akns5fbPG) |
+
+Beam's own record (`GET /swqos/tx/{signature}`): `is_landed: true`, region `nyc`, tip 100,000 lamports, held 2 ms before forwarding.
 
 ![Tripwire dashboard on live mainnet](docs/screenshot.png)
 
@@ -30,7 +41,7 @@ The gRPC decoder needs no per-DEX instruction parsing. It derives buys, sells, t
 Requires Node 20+.
 
 ```bash
-git clone <this repo> tripwire && cd tripwire
+git clone https://github.com/MHVVD/superteam tripwire && cd tripwire
 npm install
 cp .env.example .env          # put your Solami key in SOLAMI_API_KEY
 npm run doctor                # checks which Solami products the key can reach
@@ -48,6 +59,16 @@ Get a key at [solami.dev](https://solami.dev/signup?ref=st-earn-sep-26). The Pro
 | RPC | Exits: simulation in paper mode with a wallet, and all live exits |
 
 If your permissions are on different keys, set `SOLAMI_GRPC_KEY`, `SOLAMI_DATA_KEY` and `SOLAMI_RPC_KEY` separately.
+
+With a gRPC-only key Tripwire still runs the radar and tripwires; the health panel shows Blur as off and RPC as off, paper exits are quoted by Jupiter without simulation, and live exits are impossible. `npm run doctor` tells you exactly which products your key reaches.
+
+### Prove a real exit (optional, ~0.003 SOL)
+
+```bash
+npm run beam-test                               # first run: generates a burner wallet into .env and prints its address
+# send it ~0.02 SOL, then:
+npm run beam-test -- <liquid token mint> 0.003  # buy, then exit via Tripwire's exit path, both through Beam
+```
 
 ### Docker
 
@@ -70,6 +91,9 @@ All settings are environment variables. See [`.env.example`](.env.example) for t
 | `WALLET_SECRET_KEY` | none | Base58 or JSON array. **Use a burner.** |
 | `EXIT_MAX_SOL` | `0.5` | Refuse any single exit worth more than this |
 | `BEAM_TIP_LAMPORTS` | `100000` | Beam tip; 0.0001 SOL minimum |
+| `AUTO_WATCH_AUTO_EXIT` | `true` in paper mode, `false` in live | Auto-watched tokens also auto-exit |
+| `PAPER_SIZE_SOL` | `0.1` | Position size used to quote paper exits |
+| `TRIPWIRE_TOKEN` | generated when needed | API token. Required whenever `HOST` is not loopback; if unset, a random one is printed at startup as `?token=…` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `DISCORD_WEBHOOK_URL` | none | Push critical alerts and exits |
 
 Exits only sell tokens the wallet already holds; Tripwire never buys. In live mode an exit is refused when Jupiter can't quote it or when it would exceed `EXIT_MAX_SOL`. Each watch auto-exits at most once.
@@ -108,7 +132,9 @@ Exits only sell tokens the wallet already holds; Tripwire never buys. In live mo
 | `dev_transfer` | warning | dev sends ≥0.5% of supply to other wallets |
 | `whale_sell` | warning | one sell ≥2% of supply worth ≥0.1 SOL |
 
-"Avoided" is `1 − (lowest price in the 10 min after the alert) / (price at the alert)`. It is the further drop that someone who exited at the alert would not have taken.
+**Outcomes.** Each alert records `move1m` and `move5m`, the signed price change 1 and 5 minutes after it fired. Every 30s Tripwire also notes the price of each watched token and records its move 5 minutes later. That is the baseline. The dashboard tile shows the median 5-minute move after critical alerts next to the median baseline move. `avoidedPct`, the lowest price within 10 minutes, is kept as a best-case figure in tooltips only.
+
+**Noise control.** After a critical alert, further critical triggers on the same token within 5 minutes are folded into it (`suppressed`). Warnings have a 60s cooldown per rule.
 
 ## Architecture
 
@@ -139,17 +165,36 @@ test/                  vitest, including real mainnet transactions in test/fixtu
 
 The API key stays on the server; the browser only talks to the local API.
 
+## API
+
+The dashboard uses a small local API (full contract in [docs/API.md](docs/API.md)):
+
+```bash
+curl -s localhost:8787/api/snapshot | jq '.health.stats'
+curl -s -X POST localhost:8787/api/watch -H 'content-type: application/json' -d '{"mint":"<mint>","autoExit":false}'
+curl -s -X POST localhost:8787/api/exit/<mint> -H 'content-type: application/json' -d '{}'
+curl -s -X DELETE localhost:8787/api/watch/<mint>
+curl -N localhost:8787/api/stream            # Server-Sent Events: launch, alert, watch, exit, health
+```
+
+Mutating calls must be `application/json`, and a browser `Origin` must match the host. Together these block other websites from triggering exits. Add `-H 'x-tripwire-token: …'` when a token is set.
+
 ## Development
 
 ```bash
 npm test          # decoder on captured mainnet txs, tracker, scorer, tripwire rules
 npm run typecheck
 npm run dev       # restart on change
+npm run capture   # record live gRPC transactions into test/fixtures for regression tests
 ```
 
 `web/index.html?demo=1` renders the dashboard with generated data when no backend is running, which is useful for UI work.
 
 ## Limitations
+
+- pump.fun curves quoted in a token other than SOL are tracked but not priced.
+- USD figures use Jupiter's SOL price and are cosmetic; all rule math is in SOL and raw token amounts.
+- Same-slot buyers include fast bots, not only bundles controlled by the dev. The score weighs them, but alone they are not proof of a rug.
 
 - Cohorts are only reconstructed for tokens launched while Tripwire is running. For older tokens you arm by hand, the dev comes from Blur (or `devWallet` in `POST /api/watch`), and bundler/sniper roles come from Blur intel where available.
 - Radar covers pump.fun launches (and PumpSwap after graduation). Tokens armed by hand on other DEXes are tracked through their mint subscription.
