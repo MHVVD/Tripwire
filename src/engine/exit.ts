@@ -97,8 +97,8 @@ export class Exiter {
     return { raw, decimals };
   }
 
-  private async quote(mint: string, amountRaw: bigint): Promise<Record<string, unknown>> {
-    const url = `${this.opts.jupiterApi}/quote?inputMint=${mint}&outputMint=${WSOL}&amount=${amountRaw}&slippageBps=${this.opts.slippageBps}&restrictIntermediateTokens=true`;
+  private async quote(mint: string, amountRaw: bigint, outputMint = WSOL): Promise<Record<string, unknown>> {
+    const url = `${this.opts.jupiterApi}/quote?inputMint=${mint}&outputMint=${outputMint}&amount=${amountRaw}&slippageBps=${this.opts.slippageBps}&restrictIntermediateTokens=true`;
     const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
     if (!res.ok) throw new Error(`jupiter quote ${res.status}: ${(await res.text()).slice(0, 120)}`);
     return (await res.json()) as Record<string, unknown>;
@@ -139,6 +139,17 @@ export class Exiter {
     const tx = new VersionedTransaction(msg);
     tx.sign([wallet]);
     return { tx, lastValidBlockHeight };
+  }
+
+  /**
+   * Buy `lamports` worth of a token through Jupiter + Beam. Tripwire itself never buys;
+   * this exists for `npm run beam-test`, which needs a position to exit from.
+   */
+  async buyForTest(mint: string, lamports: number): Promise<{ signature: string; landMs: number }> {
+    if (!this.opts.wallet) throw new Error("WALLET_SECRET_KEY is not set");
+    const quote = await this.quote(WSOL, BigInt(lamports), mint);
+    const { tx, lastValidBlockHeight } = await this.buildTx(quote);
+    return this.beam.sendAndConfirm(tx.serialize(), lastValidBlockHeight);
   }
 
   /**
