@@ -41,7 +41,7 @@ The gRPC decoder needs no per-DEX instruction parsing. It derives buys, sells, t
 Requires Node 20+.
 
 ```bash
-git clone https://github.com/MHVVD/superteam tripwire && cd tripwire
+git clone https://github.com/MHVVD/Tripwire tripwire && cd tripwire
 npm install
 cp .env.example .env          # put your Solami key in SOLAMI_API_KEY
 npm run doctor                # checks which Solami products the key can reach
