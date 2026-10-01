@@ -154,6 +154,8 @@ export function scoreLaunch(l: Launch): RiskReport {
     for (const f of x.intelFlags ?? []) {
       if (flags.some((g) => g.id === f.name)) continue;
       if (f.name === "no_socials") add(f.name, "info", 3, f.detail);
+      else if (f.name === "dev_exited" && !flags.some((g) => g.id.startsWith("dev_"))) add(f.name, "warning", 10, f.detail);
+      else if (f.name === "no_liquidity") add(f.name, "danger", 20, f.detail);
     }
   }
 
