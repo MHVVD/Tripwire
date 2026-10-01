@@ -184,8 +184,12 @@ export class Exiter {
       } else if (this.opts.mode === "live") {
         throw new Error("wallet holds none of this token");
       } else {
-        if (!(price > 0)) throw new Error("no price for this token yet - nothing to size a paper exit with");
-        raw = BigInt(Math.floor((this.opts.paperSizeSol / price) * 10 ** decimals));
+        if (price > 0) raw = BigInt(Math.floor((this.opts.paperSizeSol / price) * 10 ** decimals));
+        else {
+          // No trade has priced it yet: size the paper position by what PAPER_SIZE_SOL buys.
+          const buy = await this.quote(WSOL, BigInt(Math.round(this.opts.paperSizeSol * 1e9)), mint);
+          raw = BigInt(String(buy.outAmount));
+        }
       }
       rec.tokens = Number(raw) / 10 ** decimals;
       const estimate = rec.tokens * price;
